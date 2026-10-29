@@ -531,7 +531,11 @@ public class ComicModule extends XposedModule {
     public void onPackageReady(XposedModuleInterface.PackageReadyParam param) {
         String packageName = param.getPackageName();
 
-        // 每个 APP 独立处理：vivo 游戏中心走专用类，漫画保留原有逻辑。
+        // 每个 APP 独立处理：小米商城、vivo 游戏中心、哔哩哔哩漫画分别适配。
+        if ("com.xiaomi.shop".equals(packageName)) {
+            com.example.comiclsposed.apps.XiaomiShop.install(this);
+            return;
+        }
         if ("com.vivo.game".equals(packageName)) {
             com.example.comiclsposed.apps.VivoGameCenter.install(this);
             return;
