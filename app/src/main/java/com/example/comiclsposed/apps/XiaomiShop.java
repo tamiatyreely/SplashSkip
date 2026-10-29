@@ -5,6 +5,7 @@ import android.app.Dialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.content.Intent;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -24,18 +25,22 @@ import io.github.libxposed.api.XposedModule;
 
 /**
  * Xiaomi Shop 5.54.0.20260811.r1 adapter.
- * 开屏广告去除策略：
- *   displaySplashView 正常执行（保证启动流程走完），
- *   60/250/800ms 后多次尝试 dismiss + 反射 removeView，
- *   使 splash overlay 快速消失，主界面正常渲染。
+ * 去开屏：
+ *   1) MainTabActivity 是 splash 壳 → onCreate 后主动跳 MainActivity
+ *   2) displaySplashView proceed + 30/200/800ms 反复 removeSplashTree 兜底
+ *   3) 扫描条件放宽到 id/class 含 "splash" 即命中，整棵子树 remove
  */
 public final class XiaomiShop {
 
     private static final String TAG = "SplashSkip-Xiaomi";
     private static final String PACKAGE = "com.xiaomi.shop";
+    // 真正的首页（日志里 4 秒后跳到这里）
+    private static final String MAIN_ACTIVITY = "com.xiaomi.shop2.activity.MainActivity";
+    // splash 壳
+    private static final String SPLASH_ACTIVITY = "com.xiaomi.shop.activity.MainTabActivity";
     private static final String AD_DIALOG = "com.xiaomi.shop.plugin.homepage.utils.AdDialog";
     private static final int MAX_CHARS = 45000;
-    private static final int MAX_NODES = 300;
+    private static final int MAX_NODES = 400;
 
     private static final StringBuilder LOG = new StringBuilder();
     private static final Set<Activity> SEEN = Collections.synchronizedSet(
@@ -43,6 +48,7 @@ public final class XiaomiShop {
     private static volatile boolean installed;
     private static volatile boolean firstToastShown;
     private static volatile boolean splashHookAttempted;
+    private static volatile boolean redirected;
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
 
     private XiaomiShop() {}
@@ -56,23 +62,30 @@ public final class XiaomiShop {
         hookActivityCreate(module);
         hookDialogShow(module);
         hookActivityResume(module);
-        note("Hooks installed; splash will be displayed then dismissed quickly.");
+        note("Hooks installed (redirect + removeSplashTree)");
     }
 
     // ------------------------------------------------------------------
-    // Activity.onCreate：提前挂 SplashPresenter Hook
+    // Activity.onCreate
     // ------------------------------------------------------------------
     private static void hookActivityCreate(XposedModule module) {
         try {
             Method create = Activity.class.getDeclaredMethod("onCreate", Bundle.class);
             module.hook(create).intercept(chain -> {
                 Object obj = chain.getThisObject();
-                if (obj instanceof Activity && isTarget((Activity) obj)) {
-                    hookSplashManager(module, ((Activity) obj).getClassLoader());
+                Activity activity = obj instanceof Activity ? (Activity) obj : null;
+                if (activity != null && isTarget(activity)) {
+                    hookSplashManager(module, activity.getClassLoader());
                 }
                 Object result = chain.proceed();
-                if (obj instanceof Activity && isTarget((Activity) obj)) {
-                    note("Activity.onCreate: " + obj.getClass().getName());
+                if (activity != null && isTarget(activity)) {
+                    String name = activity.getClass().getName();
+                    note("Activity.onCreate: " + name);
+                    // splash 壳：onCreate 完立刻跳真正的首页
+                    if (SPLASH_ACTIVITY.equals(name) && !redirected) {
+                        redirected = true;
+                        MAIN.postDelayed(() -> redirectToMain(activity), 150);
+                    }
                 }
                 return result;
             });
@@ -82,8 +95,24 @@ public final class XiaomiShop {
         }
     }
 
+    private static void redirectToMain(Activity splashActivity) {
+        try {
+            if (splashActivity.isFinishing() || splashActivity.isDestroyed()) return;
+            Intent intent = new Intent();
+            intent.setClassName(PACKAGE, MAIN_ACTIVITY);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            splashActivity.startActivity(intent);
+            note("Redirected to " + MAIN_ACTIVITY);
+            splashActivity.finish();
+            splashActivity.overridePendingTransition(0, 0);
+        } catch (Throwable t) {
+            note("redirect failed: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+            redirected = false; // 允许重试
+        }
+    }
+
     // ------------------------------------------------------------------
-    // Dialog.show：仅拦截 AdDialog 弹窗
+    // Dialog.show：仅拦截 AdDialog
     // ------------------------------------------------------------------
     private static void hookDialogShow(XposedModule module) {
         try {
@@ -109,7 +138,7 @@ public final class XiaomiShop {
     }
 
     // ------------------------------------------------------------------
-    // Activity.onResume：兜底扫描 + 复制日志
+    // Activity.onResume：兜底 removeSplashTree + 复制日志
     // ------------------------------------------------------------------
     private static void hookActivityResume(XposedModule module) {
         try {
@@ -124,10 +153,8 @@ public final class XiaomiShop {
                         if (SEEN.add(activity)) {
                             note("first resume for activity; intent=" + safeIntent(activity));
                         }
-                        scheduleSplashScan(activity, 0);
-                        scheduleSplashScan(activity, 400);
-                        scheduleSplashScan(activity, 1000);
-                        scheduleCopy(activity, 1200);
+                        scheduleRemoveSplash(activity);
+                        scheduleCopy(activity, 1500);
                     }
                 }
                 return result;
@@ -138,17 +165,22 @@ public final class XiaomiShop {
         }
     }
 
+    private static void scheduleRemoveSplash(Activity activity) {
+        MAIN.postDelayed(() -> removeSplashTree(activity), 30);
+        MAIN.postDelayed(() -> removeSplashTree(activity), 200);
+        MAIN.postDelayed(() -> removeSplashTree(activity), 800);
+    }
+
     // ------------------------------------------------------------------
-    // Hook SplashPresenter.displaySplashView：
-    // 关键改动：proceed 后再多次 dismiss，而不是 return null。
+    // Hook SplashPresenter.displaySplashView：proceed 后连续 remove
     // ------------------------------------------------------------------
     private static synchronized void hookSplashManager(XposedModule module, ClassLoader loader) {
         if (splashHookAttempted) return;
         splashHookAttempted = true;
 
         String[] targets = {
-                "com.xiaomi.shop.splash.SplashViewManager",
-                "com.xiaomi.shop.presenter.SplashPresenter"
+                "com.xiaomi.shop.presenter.SplashPresenter",
+                "com.xiaomi.shop.splash.SplashViewManager"
         };
         int hooked = 0;
 
@@ -165,13 +197,11 @@ public final class XiaomiShop {
                 try {
                     method.setAccessible(true);
                     module.hook(method).intercept(chain -> {
-                        Object receiver = chain.getThisObject();
-                        // 让原始方法执行，保证 splash 的"显示/结束"回调链完整，主内容才能渲染
                         Object result = chain.proceed();
-                        note("Splash displayed; scheduling dismiss: " + method.toGenericString());
-                        MAIN.postDelayed(() -> dismissSplashSafely(receiver, "60ms"), 60);
-                        MAIN.postDelayed(() -> dismissSplashSafely(receiver, "250ms"), 250);
-                        MAIN.postDelayed(() -> dismissSplashSafely(receiver, "800ms"), 800);
+                        note("Splash displayed; scheduling removal: " + method.toGenericString());
+                        MAIN.postDelayed(XiaomiShop::removeSplashOnCurrentActivity, 30);
+                        MAIN.postDelayed(XiaomiShop::removeSplashOnCurrentActivity, 200);
+                        MAIN.postDelayed(XiaomiShop::removeSplashOnCurrentActivity, 800);
                         return result;
                     });
                     hooked++;
@@ -184,121 +214,98 @@ public final class XiaomiShop {
         note("Splash display methods hooked=" + hooked);
     }
 
-    /**
-     * 反射尝试关闭 splash：
-     *  1) 优先调用无参 dismiss/hideSplash/removeSplash/closeSplash/skipSplash 方法；
-     *  2) 兜底：从 SplashPresenter 的 View 字段里找到 splash 根容器，从 parent remove。
-     */
-    private static void dismissSplashSafely(Object presenter, String tag) {
-        if (presenter == null) return;
-        boolean invoked = false;
-
-        Class<?> c = presenter.getClass();
-        while (c != null && c != Object.class) {
-            for (Method m : c.getDeclaredMethods()) {
-                if (m.getParameterCount() != 0) continue;
-                String n = m.getName().toLowerCase(Locale.ROOT);
-                if (n.equals("dismiss")
-                        || n.contains("dismisssplash")
-                        || n.contains("hidesplash")
-                        || n.contains("removesplash")
-                        || n.contains("closesplash")
-                        || n.contains("skipsplash")) {
-                    try {
-                        m.setAccessible(true);
-                        m.invoke(presenter);
-                        note("[" + tag + "] Invoked dismiss: " + m.getName());
-                        invoked = true;
-                    } catch (Throwable t) {
-                        note("[" + tag + "] dismiss invoke fail: " + m.getName()
-                                + " -> " + t.getClass().getSimpleName());
-                    }
-                }
-            }
-            c = c.getSuperclass();
-        }
-
-        // 兜底：反射 View 字段，从 parent 移除 splash 根容器
-        c = presenter.getClass();
-        while (c != null && c != Object.class) {
-            for (Field f : c.getDeclaredFields()) {
-                if (!View.class.isAssignableFrom(f.getType())) continue;
-                try {
-                    f.setAccessible(true);
-                    Object v = f.get(presenter);
-                    if (!(v instanceof View)) continue;
-                    View view = (View) v;
-                    if (view.getParent() instanceof ViewGroup) {
-                        ViewGroup parent = (ViewGroup) view.getParent();
-                        parent.removeView(view);
-                        note("[" + tag + "] Removed splash view: " + f.getName()
-                                + " class=" + view.getClass().getName());
-                    }
-                } catch (Throwable ignored) {}
-            }
-            c = c.getSuperclass();
-        }
-
-        if (!invoked) {
-            note("[" + tag + "] no dismiss method matched, rely on removeView/scan fallback");
+    private static void removeSplashOnCurrentActivity() {
+        try {
+            Activity a = getCurrentActivity();
+            if (a == null) return;
+            removeSplashTree(a);
+        } catch (Throwable t) {
+            note("removeSplash error: " + t.getClass().getSimpleName());
         }
     }
 
-    // ------------------------------------------------------------------
-    // 兜底扫描：只匹配 splash 根容器，不碰主界面
-    // ------------------------------------------------------------------
-    private static void scheduleSplashScan(Activity activity, long delayMs) {
+    /**
+     * 在 activity 里找到含 splash 的子树，从 contentView / decorView 的
+     * 直接子层级整棵 remove。
+     * 只要 id / 类名里含 "splash" 就算命中，避免之前
+     * bg_splash_logo_img / bg_splash_logo_lin 这种 id 匹配不到的问题。
+     */
+    private static void removeSplashTree(Activity activity) {
         try {
             View decor = activity.getWindow() == null ? null : activity.getWindow().getDecorView();
-            if (decor == null) return;
-            decor.postDelayed(() -> {
-                try {
-                    scanAndRemoveSplash(decor, new int[]{0});
-                } catch (Throwable t) {
-                    note("splash scan error: " + t.getClass().getSimpleName());
+            if (!(decor instanceof ViewGroup)) return;
+            ViewGroup decorGroup = (ViewGroup) decor;
+
+            View content = decorGroup.findViewById(android.R.id.content);
+
+            // 1) contentView 内部（splash 通常挂在 content 里）
+            if (content instanceof ViewGroup) {
+                ViewGroup contentGroup = (ViewGroup) content;
+                for (int i = contentGroup.getChildCount() - 1; i >= 0; i--) {
+                    View child = contentGroup.getChildAt(i);
+                    if (containsSplash(child, new int[]{0})) {
+                        contentGroup.removeViewAt(i);
+                        note("Removed splash in contentView: " + describe(child));
+                    }
                 }
-            }, delayMs);
-        } catch (Throwable ignored) {}
-    }
+            }
 
-    private static void scanAndRemoveSplash(View view, int[] count) {
-        if (view == null || count[0]++ > MAX_NODES) return;
-        if (isSplashRootContainer(view)) {
-            if (view.getParent() instanceof ViewGroup) {
-                ViewGroup parent = (ViewGroup) view.getParent();
-                parent.removeView(view);
-                note("scan removed splash root: " + describe(view));
-                copyClipboard(view.getContext());
-            } else if (view.getVisibility() != View.GONE) {
-                view.setVisibility(View.GONE);
-                note("scan GONE splash root: " + describe(view));
+            // 2) decorView 非 content 的直接子（overlay 形式的 splash）
+            for (int i = decorGroup.getChildCount() - 1; i >= 0; i--) {
+                View child = decorGroup.getChildAt(i);
+                if (child == content) continue;
+                if (containsSplash(child, new int[]{0})) {
+                    decorGroup.removeViewAt(i);
+                    note("Removed splash overlay in decor: " + describe(child));
+                }
             }
-            return;
-        }
-        if (view instanceof ViewGroup) {
-            ViewGroup group = (ViewGroup) view;
-            for (int i = 0; i < group.getChildCount() && count[0] < MAX_NODES; i++) {
-                scanAndRemoveSplash(group.getChildAt(i), count);
-            }
+        } catch (Throwable t) {
+            note("removeSplashTree error: " + t.getClass().getSimpleName());
         }
     }
 
-    /** 只匹配 splash 的"根容器"，不碰 logo 等内部小元素（内部元素随根容器一起消失）。 */
-    private static boolean isSplashRootContainer(View view) {
-        String cls = view.getClass().getName().toLowerCase(Locale.ROOT);
-        String id = resourceName(view).toLowerCase(Locale.ROOT);
-        return cls.contains("splashview")
-                || cls.contains("splashroot")
-                || cls.contains("splashlayout")
-                || cls.contains("splashcontainer")
-                || id.contains("splashview")
-                || id.contains("splash_root")
-                || id.contains("splashlayout")
-                || id.contains("splash_container");
+    /** id / 类名含 "splash" 即视为命中（不区分大小写）。 */
+    private static boolean containsSplash(View v, int[] count) {
+        if (v == null || count[0]++ > MAX_NODES) return false;
+        String cls = v.getClass().getName().toLowerCase(Locale.ROOT);
+        String id = resourceName(v).toLowerCase(Locale.ROOT);
+        if (cls.contains("splash") || id.contains("splash")) return true;
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount() && count[0] < MAX_NODES; i++) {
+                if (containsSplash(g.getChildAt(i), count)) return true;
+            }
+        }
+        return false;
     }
 
     // ------------------------------------------------------------------
-    // 工具
+    // 反射获取当前前台 Activity
+    // ------------------------------------------------------------------
+    private static Activity getCurrentActivity() {
+        try {
+            Class<?> atClass = Class.forName("android.app.ActivityThread");
+            Method currentAT = atClass.getDeclaredMethod("currentActivityThread");
+            Object thread = currentAT.invoke(null);
+            Field activitiesField = atClass.getDeclaredField("mActivities");
+            activitiesField.setAccessible(true);
+            Object activities = activitiesField.get(thread);
+            if (activities instanceof java.util.Map) {
+                for (Object record : ((java.util.Map<?, ?>) activities).values()) {
+                    Field actField = record.getClass().getDeclaredField("activity");
+                    actField.setAccessible(true);
+                    Object act = actField.get(record);
+                    if (act instanceof Activity && !((Activity) act).isFinishing()) {
+                        return (Activity) act;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    // ------------------------------------------------------------------
+    // 工具方法
     // ------------------------------------------------------------------
     private static void scheduleCopy(Activity activity, long delayMs) {
         try {
