@@ -14,6 +14,7 @@ import android.view.ViewGroup;
 import android.widget.TextView;
 
 import java.lang.reflect.Method;
+import java.lang.reflect.InvocationTargetException;
 import java.util.Collections;
 import java.util.Locale;
 import java.util.Set;
@@ -39,6 +40,7 @@ public final class XiaomiShop {
             Collections.newSetFromMap(new WeakHashMap<Activity, Boolean>()));
     private static volatile boolean installed;
     private static volatile boolean firstToastShown;
+    private static volatile boolean splashManagerHookAttempted;
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
 
     private XiaomiShop() {}
@@ -54,7 +56,7 @@ public final class XiaomiShop {
         hookDialogShow(module);
         hookActivityResume(module);
         hookSplashViewInsertion(module);
-        note("Hooks installed; exact AdDialog blocker active; Xiaomi SplashActionView/resource-ID suppression active.");
+        note("Hooks installed; exact AdDialog blocker active; splash-manager hook will attach before target Activity onCreate.");
         copyClipboardForProcess(module);
     }
 
@@ -64,6 +66,12 @@ public final class XiaomiShop {
             Method create = Activity.class.getDeclaredMethod("onCreate", Bundle.class);
             module.hook(create).intercept(chain -> {
                 Object obj = chain.getThisObject();
+                // Attach to the app's actual class loader before the original Activity
+                // onCreate runs, so the splash manager is hooked before it can render.
+                if (obj instanceof Activity && isTarget((Activity) obj)) {
+                    Activity targetActivity = (Activity) obj;
+                    hookSplashManager(module, targetActivity.getClassLoader());
+                }
                 Object result = chain.proceed();
                 if (obj instanceof Activity) {
                     Activity activity = (Activity) obj;
@@ -156,6 +164,84 @@ public final class XiaomiShop {
         } catch (Throwable t) {
             note("Hook FAIL Activity.onResume: " + t.getClass().getSimpleName() + ": " + t.getMessage());
         }
+    }
+
+    /**
+     * APK inspection found the real splash pipeline:
+     * com.xiaomi.shop.splash.SplashViewManager.displaySplashView.
+     * Hiding SplashActionView alone only removes its action layer; it does not
+     * remove the splash content. Intercept the manager entry point instead.
+     */
+    private static synchronized void hookSplashManager(XposedModule module, ClassLoader loader) {
+        if (splashManagerHookAttempted) return;
+        splashManagerHookAttempted = true;
+        String[] targets = {
+                "com.xiaomi.shop.splash.SplashViewManager",
+                "com.xiaomi.shop.presenter.SplashPresenter"
+        };
+        int hooked = 0;
+        for (String className : targets) {
+            try {
+                Class<?> cls = Class.forName(className, false, loader);
+                for (Method method : cls.getDeclaredMethods()) {
+                    String methodName = method.getName();
+                    // Do not block general presenter initialization or navigation.
+                    // Only block the method explicitly responsible for displaying splash UI.
+                    if (!"displaySplashView".equals(methodName)) continue;
+                    try {
+                        method.setAccessible(true);
+                        module.hook(method).intercept(chain -> {
+                            note("BLOCK splash display method: " + method.toGenericString());
+                            Object receiver = chain.getThisObject();
+                            if (receiver != null) {
+                                try {
+                                    java.lang.reflect.Field[] fields = receiver.getClass().getDeclaredFields();
+                                    for (java.lang.reflect.Field field : fields) {
+                                        if (View.class.isAssignableFrom(field.getType())) {
+                                            try {
+                                                field.setAccessible(true);
+                                                Object value = field.get(receiver);
+                                                if (value instanceof View) {
+                                                    View view = (View) value;
+                                                    view.post(() -> {
+                                                        view.setVisibility(View.GONE);
+                                                        note("GONE splash-related field view: " + field.getName()
+                                                                + " class=" + view.getClass().getName());
+                                                        copyClipboard(view.getContext());
+                                                    });
+                                                }
+                                            } catch (Throwable ignored) {}
+                                        }
+                                    }
+                                } catch (Throwable ignored) {}
+                            }
+                            return defaultValue(method.getReturnType());
+                        });
+                        hooked++;
+                        note("Hook OK splash manager method: " + method.toGenericString());
+                    } catch (Throwable t) {
+                        note("Hook FAIL splash manager method " + methodName + ": "
+                                + t.getClass().getSimpleName() + ": " + t.getMessage());
+                    }
+                }
+            } catch (Throwable t) {
+                note("Splash class unavailable " + className + ": " + t.getClass().getSimpleName());
+            }
+        }
+        note("Splash display methods hooked=" + hooked);
+    }
+
+    private static Object defaultValue(Class<?> type) {
+        if (!type.isPrimitive() || type == Void.TYPE) return null;
+        if (type == Boolean.TYPE) return false;
+        if (type == Byte.TYPE) return (byte) 0;
+        if (type == Short.TYPE) return (short) 0;
+        if (type == Integer.TYPE) return 0;
+        if (type == Long.TYPE) return 0L;
+        if (type == Float.TYPE) return 0f;
+        if (type == Double.TYPE) return 0d;
+        if (type == Character.TYPE) return '\0';
+        return null;
     }
 
     /**
