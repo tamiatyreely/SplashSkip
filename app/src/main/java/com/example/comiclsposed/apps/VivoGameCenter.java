@@ -21,16 +21,12 @@ import java.util.WeakHashMap;
 import io.github.libxposed.api.XposedModule;
 
 /**
- * vivo 游戏中心去广告模块（运行时 ClassLoader 修复版）。
+ * vivo 游戏中心去广告模块（彻底消除开屏闪现版）。
  *
- * 关键修复：
- * - 不在 install() 阶段用模块的 ClassLoader 去加载目标类。
- * - 改为 Hook Activity.onResume，在拦截器里按类名判断，
- *   此时 ClassLoader 天然正确，且实例已存在。
- * - VivoADSDK 改为在 LogoActivity.onCreate 时
- *   用 activity.getClassLoader() 动态加载并 Hook init。
- *
- * 日志自动复制到剪贴板。
+ * 关键调整：
+ * 1. 跳过延迟设为 0，onResume 后立即 finish，不给广告渲染时间。
+ * 2. 调用 overridePendingTransition(0, 0) 禁用切换动画，消除视觉闪烁。
+ * 3. 先 startActivity 再 finish，保证过渡平滑。
  */
 public final class VivoGameCenter {
 
@@ -46,7 +42,9 @@ public final class VivoGameCenter {
     private static final String AD_SDK =
             "com.vivo.adsdk.common.VivoADSDK";
 
-    private static final long LOGO_SKIP_DELAY_MS = 300L;
+    /** 关键修改：延迟设为 0，立即跳过 */
+    private static final long LOGO_SKIP_DELAY_MS = 0L;
+
     private static final long CLIPBOARD_DEBOUNCE_MS = 900L;
     private static final int MAX_LOG_LENGTH = 28000;
 
@@ -75,9 +73,9 @@ public final class VivoGameCenter {
         }
         installed = true;
 
-        diag("=== Vivo 游戏中心去广告模块启动（运行时 ClassLoader 修复版）===");
+        diag("=== Vivo 游戏中心去广告模块启动（彻底消除闪现版）===");
         diag("目标包名: " + PACKAGE);
-        diag("跳过延迟: " + LOGO_SKIP_DELAY_MS + "ms");
+        diag("跳过延迟: " + LOGO_SKIP_DELAY_MS + "ms (立即跳过)");
 
         hookAllActivityOnCreate(module);
         hookAllActivityOnResume(module);
@@ -107,7 +105,6 @@ public final class VivoGameCenter {
 
                             if (LOGO_ACTIVITY.equals(name)) {
                                 injectSkipExtras(act);
-                                // 运行时用正确 ClassLoader 加载并 Hook SDK
                                 hookAdSdkInitDynamic(
                                         module,
                                         act.getClassLoader());
@@ -141,10 +138,6 @@ public final class VivoGameCenter {
         }
     }
 
-    /**
-     * 动态加载 VivoADSDK 并拦截其 init 方法。
-     * 必须在目标应用的 ClassLoader 下执行。
-     */
     private static void hookAdSdkInitDynamic(
             XposedModule module,
             ClassLoader targetCl
@@ -164,7 +157,6 @@ public final class VivoGameCenter {
                     continue;
                 }
                 if (Modifier.isAbstract(m.getModifiers())) {
-                    // 抽象方法无法直接 Hook，跳过
                     continue;
                 }
                 if (!HOOKED_METHODS.add(m.toGenericString())) {
@@ -201,7 +193,7 @@ public final class VivoGameCenter {
     }
 
     // ============================================================
-    //  2. 全局 Activity.onResume：按类名判断，直接跳过 Splash 页
+    //  2. 全局 Activity.onResume：立即跳过 Splash 页
     // ============================================================
 
     private static void hookAllActivityOnResume(XposedModule module) {
@@ -240,13 +232,14 @@ public final class VivoGameCenter {
     }
 
     private static void scheduleSkip(Activity act) {
-        MAIN_HANDLER.postDelayed(() -> {
+        // 延迟为 0，直接在当前消息循环中执行
+        MAIN_HANDLER.post(() -> {
             try {
                 if (act.isFinishing() || act.isDestroyed()) {
                     return;
                 }
 
-                diag("延迟触发跳过: "
+                diag("立即触发跳过: "
                         + act.getClass().getSimpleName());
 
                 Intent intent = new Intent();
@@ -255,17 +248,21 @@ public final class VivoGameCenter {
                         Intent.FLAG_ACTIVITY_NEW_TASK
                                 | Intent.FLAG_ACTIVITY_CLEAR_TOP);
 
+                // 先启动主界面，再结束当前页，避免白屏
                 act.startActivity(intent);
                 act.finish();
 
+                // 关键：禁用 Activity 切换动画，消除闪一下
+                act.overridePendingTransition(0, 0);
+
                 diag("已跳过 "
                         + act.getClass().getSimpleName()
-                        + " 并启动主界面");
+                        + " 并启动主界面（无动画）");
 
             } catch (Throwable e) {
                 diag("跳过失败: " + e);
             }
-        }, LOGO_SKIP_DELAY_MS);
+        });
     }
 
     // ============================================================
