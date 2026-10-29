@@ -12,7 +12,7 @@
 
         <meta-data
             android:name="xposeddescription"
-            android:value="SplashSkip: Bilibili Comics, vivo Game Center and Xiaomi Shop diagnostics" />
+            android:value="SplashSkip: Bilibili Comics, vivo Game Center and Xiaomi Shop" />
 
         <meta-data
             android:name="xposedminversion"
