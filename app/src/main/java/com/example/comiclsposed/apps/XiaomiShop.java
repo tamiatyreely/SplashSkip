@@ -24,16 +24,15 @@ import io.github.libxposed.api.XposedModule;
 
 /**
  * Xiaomi Shop 5.54.0.20260811.r1 adapter.
- * 去除开屏广告：拦截 SplashPresenter.displaySplashView，
- * 并清理 splash 相关 View；不再全局 Hook ViewGroup.addView，
- * 避免主线程过载导致启动卡死。
+ * 开屏广告去除策略：
+ *   displaySplashView 正常执行（保证启动流程走完），
+ *   60/250/800ms 后多次尝试 dismiss + 反射 removeView，
+ *   使 splash overlay 快速消失，主界面正常渲染。
  */
 public final class XiaomiShop {
 
     private static final String TAG = "SplashSkip-Xiaomi";
     private static final String PACKAGE = "com.xiaomi.shop";
-    // 修正：实际 launcher Activity
-    private static final String MAIN_ACTIVITY = "com.xiaomi.shop.activity.MainTabActivity";
     private static final String AD_DIALOG = "com.xiaomi.shop.plugin.homepage.utils.AdDialog";
     private static final int MAX_CHARS = 45000;
     private static final int MAX_NODES = 300;
@@ -54,15 +53,14 @@ public final class XiaomiShop {
         note("================================================");
         note("SplashSkip Xiaomi Shop adapter loaded");
         note("package=" + PACKAGE + ", targetVersion=5.54.0.20260811.r1");
-        note("confirmed popup class=" + AD_DIALOG);
         hookActivityCreate(module);
         hookDialogShow(module);
         hookActivityResume(module);
-        note("Hooks installed; splash manager hook attaches before target Activity onCreate.");
+        note("Hooks installed; splash will be displayed then dismissed quickly.");
     }
 
     // ------------------------------------------------------------------
-    // Activity.onCreate：在原始 onCreate 之前挂 SplashPresenter Hook
+    // Activity.onCreate：提前挂 SplashPresenter Hook
     // ------------------------------------------------------------------
     private static void hookActivityCreate(XposedModule module) {
         try {
@@ -70,50 +68,22 @@ public final class XiaomiShop {
             module.hook(create).intercept(chain -> {
                 Object obj = chain.getThisObject();
                 if (obj instanceof Activity && isTarget((Activity) obj)) {
-                    Activity activity = (Activity) obj;
-                    // 必须在 proceed 之前挂，否则 displaySplashView 可能已被调用
-                    hookSplashManager(module, activity.getClassLoader());
+                    hookSplashManager(module, ((Activity) obj).getClassLoader());
                 }
                 Object result = chain.proceed();
-                if (obj instanceof Activity) {
-                    Activity activity = (Activity) obj;
-                    if (isTarget(activity)) {
-                        String name = activity.getClass().getName();
-                        note("Activity.onCreate: " + name);
-                        String lower = name.toLowerCase(Locale.ROOT);
-                        // 只跳过明确的独立开屏 Activity，不碰 MainTabActivity 和普通页面
-                        boolean splashLike = lower.contains("splash")
-                                || lower.contains("launchad")
-                                || lower.contains("adlaunch");
-                        if (splashLike && !MAIN_ACTIVITY.equals(name)
-                                && !activity.isFinishing() && !activity.isDestroyed()) {
-                            note("BLOCK splash-like Activity: " + name);
-                            try {
-                                android.content.Intent intent = new android.content.Intent();
-                                intent.setClassName(PACKAGE, MAIN_ACTIVITY);
-                                intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK
-                                        | android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP);
-                                activity.startActivity(intent);
-                                activity.finish();
-                                activity.overridePendingTransition(0, 0);
-                                note("Started " + MAIN_ACTIVITY + " to skip splash-like Activity.");
-                                copyClipboard(activity);
-                            } catch (Throwable t) {
-                                note("Splash Activity skip failed: " + t.getClass().getSimpleName());
-                            }
-                        }
-                    }
+                if (obj instanceof Activity && isTarget((Activity) obj)) {
+                    note("Activity.onCreate: " + obj.getClass().getName());
                 }
                 return result;
             });
-            note("Hook OK: Activity.onCreate (splash-like Activity detection)");
+            note("Hook OK: Activity.onCreate");
         } catch (Throwable t) {
             note("Hook FAIL Activity.onCreate: " + t.getClass().getSimpleName() + ": " + t.getMessage());
         }
     }
 
     // ------------------------------------------------------------------
-    // Dialog.show：仅精确拦截 AdDialog
+    // Dialog.show：仅拦截 AdDialog 弹窗
     // ------------------------------------------------------------------
     private static void hookDialogShow(XposedModule module) {
         try {
@@ -125,12 +95,9 @@ public final class XiaomiShop {
                     if (isTarget(dialog.getContext())
                             && AD_DIALOG.equals(dialog.getClass().getName())) {
                         note("BLOCK Dialog.show: " + AD_DIALOG);
-                        note("弹窗广告已在显示前拦截。");
-                        try {
-                            if (dialog.isShowing()) dialog.dismiss();
-                        } catch (Throwable ignored) {}
+                        try { if (dialog.isShowing()) dialog.dismiss(); } catch (Throwable ignored) {}
                         copyClipboard(dialog.getContext());
-                        return null; // 不执行原 show
+                        return null;
                     }
                 }
                 return chain.proceed();
@@ -142,7 +109,7 @@ public final class XiaomiShop {
     }
 
     // ------------------------------------------------------------------
-    // Activity.onResume：轻量兜底扫描 + 复制日志
+    // Activity.onResume：兜底扫描 + 复制日志
     // ------------------------------------------------------------------
     private static void hookActivityResume(XposedModule module) {
         try {
@@ -153,15 +120,14 @@ public final class XiaomiShop {
                 if (obj instanceof Activity) {
                     Activity activity = (Activity) obj;
                     if (isTarget(activity)) {
-                        String cls = activity.getClass().getName();
-                        note("Activity.onResume: " + cls);
+                        note("Activity.onResume: " + activity.getClass().getName());
                         if (SEEN.add(activity)) {
                             note("first resume for activity; intent=" + safeIntent(activity));
                         }
-                        // 只做轻量 splash 扫描，不再扫描 cover 容器，避免误伤主界面
                         scheduleSplashScan(activity, 0);
-                        scheduleSplashScan(activity, 300);
-                        scheduleCopy(activity, 600);
+                        scheduleSplashScan(activity, 400);
+                        scheduleSplashScan(activity, 1000);
+                        scheduleCopy(activity, 1200);
                     }
                 }
                 return result;
@@ -173,7 +139,8 @@ public final class XiaomiShop {
     }
 
     // ------------------------------------------------------------------
-    // Hook SplashPresenter / SplashViewManager
+    // Hook SplashPresenter.displaySplashView：
+    // 关键改动：proceed 后再多次 dismiss，而不是 return null。
     // ------------------------------------------------------------------
     private static synchronized void hookSplashManager(XposedModule module, ClassLoader loader) {
         if (splashHookAttempted) return;
@@ -190,82 +157,95 @@ public final class XiaomiShop {
             try {
                 cls = Class.forName(className, false, loader);
             } catch (Throwable t) {
-                note("Splash class unavailable " + className + ": " + t.getClass().getSimpleName());
+                note("Splash class unavailable " + className);
                 continue;
             }
             for (Method method : cls.getDeclaredMethods()) {
-                String methodName = method.getName();
-                String lower = methodName.toLowerCase(Locale.ROOT);
-                boolean display = "displaySplashView".equals(methodName);
-                boolean cleanup = lower.contains("dismiss")
-                        || lower.contains("hide")
-                        || lower.contains("remove");
-                if (!display && !cleanup) continue;
-
+                if (!"displaySplashView".equals(method.getName())) continue;
                 try {
                     method.setAccessible(true);
                     module.hook(method).intercept(chain -> {
                         Object receiver = chain.getThisObject();
-                        if (display) {
-                            note("BLOCK splash display method: " + method.toGenericString());
-                            hideSplashFields(receiver);
-                            return defaultValue(method.getReturnType());
-                        }
-                        // dismiss/hide/remove：正常执行，然后顺手清理 splash View
-                        Object r = chain.proceed();
-                        hideSplashFields(receiver);
-                        return r;
+                        // 让原始方法执行，保证 splash 的"显示/结束"回调链完整，主内容才能渲染
+                        Object result = chain.proceed();
+                        note("Splash displayed; scheduling dismiss: " + method.toGenericString());
+                        MAIN.postDelayed(() -> dismissSplashSafely(receiver, "60ms"), 60);
+                        MAIN.postDelayed(() -> dismissSplashSafely(receiver, "250ms"), 250);
+                        MAIN.postDelayed(() -> dismissSplashSafely(receiver, "800ms"), 800);
+                        return result;
                     });
                     hooked++;
-                    note("Hook OK splash manager method: " + method.toGenericString());
+                    note("Hook OK splash display: " + method.toGenericString());
                 } catch (Throwable t) {
-                    note("Hook FAIL splash manager method " + methodName + ": "
-                            + t.getClass().getSimpleName() + ": " + t.getMessage());
+                    note("Hook FAIL splash method: " + t.getClass().getSimpleName() + ": " + t.getMessage());
                 }
             }
         }
         note("Splash display methods hooked=" + hooked);
     }
 
-    /** 反射把 SplashPresenter 里持有的 View 字段设为 GONE，防止 splash 残影。 */
-    private static void hideSplashFields(Object receiver) {
-        if (receiver == null) return;
-        try {
-            for (Field field : receiver.getClass().getDeclaredFields()) {
-                if (!View.class.isAssignableFrom(field.getType())) continue;
+    /**
+     * 反射尝试关闭 splash：
+     *  1) 优先调用无参 dismiss/hideSplash/removeSplash/closeSplash/skipSplash 方法；
+     *  2) 兜底：从 SplashPresenter 的 View 字段里找到 splash 根容器，从 parent remove。
+     */
+    private static void dismissSplashSafely(Object presenter, String tag) {
+        if (presenter == null) return;
+        boolean invoked = false;
+
+        Class<?> c = presenter.getClass();
+        while (c != null && c != Object.class) {
+            for (Method m : c.getDeclaredMethods()) {
+                if (m.getParameterCount() != 0) continue;
+                String n = m.getName().toLowerCase(Locale.ROOT);
+                if (n.equals("dismiss")
+                        || n.contains("dismisssplash")
+                        || n.contains("hidesplash")
+                        || n.contains("removesplash")
+                        || n.contains("closesplash")
+                        || n.contains("skipsplash")) {
+                    try {
+                        m.setAccessible(true);
+                        m.invoke(presenter);
+                        note("[" + tag + "] Invoked dismiss: " + m.getName());
+                        invoked = true;
+                    } catch (Throwable t) {
+                        note("[" + tag + "] dismiss invoke fail: " + m.getName()
+                                + " -> " + t.getClass().getSimpleName());
+                    }
+                }
+            }
+            c = c.getSuperclass();
+        }
+
+        // 兜底：反射 View 字段，从 parent 移除 splash 根容器
+        c = presenter.getClass();
+        while (c != null && c != Object.class) {
+            for (Field f : c.getDeclaredFields()) {
+                if (!View.class.isAssignableFrom(f.getType())) continue;
                 try {
-                    field.setAccessible(true);
-                    Object value = field.get(receiver);
-                    if (value instanceof View) {
-                        View view = (View) value;
-                        view.post(() -> {
-                            try {
-                                view.setVisibility(View.GONE);
-                                note("GONE splash field view: " + field.getName()
-                                        + " class=" + view.getClass().getName());
-                            } catch (Throwable ignored) {}
-                        });
+                    f.setAccessible(true);
+                    Object v = f.get(presenter);
+                    if (!(v instanceof View)) continue;
+                    View view = (View) v;
+                    if (view.getParent() instanceof ViewGroup) {
+                        ViewGroup parent = (ViewGroup) view.getParent();
+                        parent.removeView(view);
+                        note("[" + tag + "] Removed splash view: " + f.getName()
+                                + " class=" + view.getClass().getName());
                     }
                 } catch (Throwable ignored) {}
             }
-        } catch (Throwable ignored) {}
-    }
+            c = c.getSuperclass();
+        }
 
-    private static Object defaultValue(Class<?> type) {
-        if (!type.isPrimitive() || type == Void.TYPE) return null;
-        if (type == Boolean.TYPE) return false;
-        if (type == Byte.TYPE) return (byte) 0;
-        if (type == Short.TYPE) return (short) 0;
-        if (type == Integer.TYPE) return 0;
-        if (type == Long.TYPE) return 0L;
-        if (type == Float.TYPE) return 0f;
-        if (type == Double.TYPE) return 0d;
-        if (type == Character.TYPE) return '\0';
-        return null;
+        if (!invoked) {
+            note("[" + tag + "] no dismiss method matched, rely on removeView/scan fallback");
+        }
     }
 
     // ------------------------------------------------------------------
-    // 轻量 splash View 扫描（只按 splash 关键字识别，避免误伤主界面）
+    // 兜底扫描：只匹配 splash 根容器，不碰主界面
     // ------------------------------------------------------------------
     private static void scheduleSplashScan(Activity activity, long delayMs) {
         try {
@@ -273,7 +253,7 @@ public final class XiaomiShop {
             if (decor == null) return;
             decor.postDelayed(() -> {
                 try {
-                    scanAndHideSplash(decor, new int[]{0});
+                    scanAndRemoveSplash(decor, new int[]{0});
                 } catch (Throwable t) {
                     note("splash scan error: " + t.getClass().getSimpleName());
                 }
@@ -281,36 +261,45 @@ public final class XiaomiShop {
         } catch (Throwable ignored) {}
     }
 
-    private static void scanAndHideSplash(View view, int[] count) {
+    private static void scanAndRemoveSplash(View view, int[] count) {
         if (view == null || count[0]++ > MAX_NODES) return;
-        if (isSplashView(view)) {
-            if (view.getVisibility() != View.GONE) {
-                view.setVisibility(View.GONE);
-                note("BLOCK splash view: " + describe(view));
+        if (isSplashRootContainer(view)) {
+            if (view.getParent() instanceof ViewGroup) {
+                ViewGroup parent = (ViewGroup) view.getParent();
+                parent.removeView(view);
+                note("scan removed splash root: " + describe(view));
                 copyClipboard(view.getContext());
+            } else if (view.getVisibility() != View.GONE) {
+                view.setVisibility(View.GONE);
+                note("scan GONE splash root: " + describe(view));
             }
             return;
         }
         if (view instanceof ViewGroup) {
             ViewGroup group = (ViewGroup) view;
             for (int i = 0; i < group.getChildCount() && count[0] < MAX_NODES; i++) {
-                scanAndHideSplash(group.getChildAt(i), count);
+                scanAndRemoveSplash(group.getChildAt(i), count);
             }
         }
     }
 
-    private static boolean isSplashView(View view) {
-        String cls = view.getClass().getName();
-        String id = resourceName(view);
-        if ("com.xiaomi.shop.view.SplashActionView".equals(cls)) return true;
-        String lowerCls = cls.toLowerCase(Locale.ROOT);
-        String lowerId = id.toLowerCase(Locale.ROOT);
-        // 只认类名/资源名里明确带 splash 的 View
-        if (lowerCls.contains("splash")) return true;
-        if (lowerId.contains("splash")) return true;
-        return false;
+    /** 只匹配 splash 的"根容器"，不碰 logo 等内部小元素（内部元素随根容器一起消失）。 */
+    private static boolean isSplashRootContainer(View view) {
+        String cls = view.getClass().getName().toLowerCase(Locale.ROOT);
+        String id = resourceName(view).toLowerCase(Locale.ROOT);
+        return cls.contains("splashview")
+                || cls.contains("splashroot")
+                || cls.contains("splashlayout")
+                || cls.contains("splashcontainer")
+                || id.contains("splashview")
+                || id.contains("splash_root")
+                || id.contains("splashlayout")
+                || id.contains("splash_container");
     }
 
+    // ------------------------------------------------------------------
+    // 工具
+    // ------------------------------------------------------------------
     private static void scheduleCopy(Activity activity, long delayMs) {
         try {
             View decor = activity.getWindow() == null ? null : activity.getWindow().getDecorView();
@@ -318,9 +307,6 @@ public final class XiaomiShop {
         } catch (Throwable ignored) {}
     }
 
-    // ------------------------------------------------------------------
-    // 工具方法
-    // ------------------------------------------------------------------
     private static boolean isTarget(Context context) {
         try { return context != null && PACKAGE.equals(context.getPackageName()); }
         catch (Throwable ignored) { return false; }
@@ -344,8 +330,7 @@ public final class XiaomiShop {
     }
 
     private static String describe(View v) {
-        return v.getClass().getName() + " id=" + resourceName(v)
-                + " visibility=" + v.getVisibility();
+        return v.getClass().getName() + " id=" + resourceName(v);
     }
 
     private static synchronized void note(String message) {
