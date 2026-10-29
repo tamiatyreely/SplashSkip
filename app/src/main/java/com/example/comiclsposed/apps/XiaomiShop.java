@@ -11,13 +11,10 @@ import android.os.Looper;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.PopupWindow;
 import android.widget.TextView;
-import android.webkit.WebView;
 
 import java.lang.reflect.Method;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.Locale;
 import java.util.Set;
 import java.util.WeakHashMap;
@@ -25,27 +22,23 @@ import java.util.WeakHashMap;
 import io.github.libxposed.api.XposedModule;
 
 /**
- * 小米商城 5.54.0.20260811.r1 诊断适配器。
- *
- * 本版只记录开屏/弹窗线索，不执行拦截、不模拟点击、不改变商城行为。
- * 重要事件发生时将最近的诊断日志自动复制到剪贴板。
+ * Xiaomi Shop 5.54.0.20260811.r1 adapter.
+ * Targets the confirmed AdDialog class and the video-cover container seen in
+ * the user's runtime view-tree log. Copies a redacted rolling log to clipboard.
  */
 public final class XiaomiShop {
     private static final String TAG = "SplashSkip-Xiaomi";
     private static final String PACKAGE = "com.xiaomi.shop";
-    private static final int MAX_LOG_CHARS = 50000;
-    private static final int MAX_VIEW_NODES = 220;
+    private static final String MAIN_ACTIVITY = "com.xiaomi.shop2.activity.MainActivity";
+    private static final String AD_DIALOG = "com.xiaomi.shop.plugin.homepage.utils.AdDialog";
+    private static final int MAX_CHARS = 45000;
+    private static final int MAX_NODES = 450;
 
     private static final StringBuilder LOG = new StringBuilder();
-    private static final Set<String> HOOKED =
-            Collections.synchronizedSet(new HashSet<String>());
-    private static final Set<Activity> SEEN =
-            Collections.synchronizedSet(
-                    Collections.newSetFromMap(new WeakHashMap<Activity, Boolean>()));
-
+    private static final Set<Activity> SEEN = Collections.synchronizedSet(
+            Collections.newSetFromMap(new WeakHashMap<Activity, Boolean>()));
     private static volatile boolean installed;
-    private static volatile boolean toastShown;
-    private static volatile Activity lastActivity;
+    private static volatile boolean firstToastShown;
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
 
     private XiaomiShop() {}
@@ -54,52 +47,102 @@ public final class XiaomiShop {
         if (installed) return;
         installed = true;
         note("================================================");
-        note("SplashSkip 小米商城诊断适配器启动");
-        note("目标包名: " + PACKAGE);
-        note("目标版本: 5.54.0.20260811.r1");
-        note("模式: 只诊断，不拦截、不模拟点击");
-        hookActivityLifecycle(module);
-        hookDialogs(module);
-        hookPopups(module);
-        hookWebView(module);
-        note("诊断 Hook 安装完成；打开商城并复现开屏/弹窗后，直接粘贴剪贴板日志。");
+        note("SplashSkip Xiaomi Shop adapter loaded");
+        note("package=" + PACKAGE + ", targetVersion=5.54.0.20260811.r1");
+        note("confirmed popup class=" + AD_DIALOG);
+        hookActivityCreate(module);
+        hookDialogShow(module);
+        hookActivityResume(module);
+        note("Hooks installed; popup blocker active; startup/video-cover inspection active.");
+        copyClipboardForProcess(module);
     }
 
-    private static void hookActivityLifecycle(XposedModule module) {
+
+    private static void hookActivityCreate(XposedModule module) {
         try {
-            Method m = Activity.class.getDeclaredMethod("onCreate", Bundle.class);
-            module.hook(m).intercept(chain -> {
-                Object result = chain.proceed();
+            Method create = Activity.class.getDeclaredMethod("onCreate", Bundle.class);
+            module.hook(create).intercept(chain -> {
                 Object obj = chain.getThisObject();
+                Object result = chain.proceed();
                 if (obj instanceof Activity) {
-                    Activity a = (Activity) obj;
-                    if (isTarget(a)) {
-                        lastActivity = a;
-                        note("Activity.onCreate: " + a.getClass().getName());
-                        note("Intent action: " + safe(a.getIntent() == null ? null : a.getIntent().getAction()));
-                        note("Intent data: " + safe(a.getIntent() == null || a.getIntent().getData() == null
-                                ? null : a.getIntent().getData().toString()));
-                        scheduleViewDump(a, "onCreate");
+                    Activity activity = (Activity) obj;
+                    if (isTarget(activity)) {
+                        String name = activity.getClass().getName();
+                        String lower = name.toLowerCase(Locale.ROOT);
+                        note("Activity.onCreate: " + name);
+                        // Only auto-skip clearly named splash/ad-launch activities.
+                        // MainActivity and all ordinary shopping pages are excluded.
+                        boolean splashLike = lower.contains("splash")
+                                || lower.contains("startup")
+                                || lower.contains("launchad")
+                                || lower.contains("adlaunch")
+                                || lower.contains("advert");
+                        if (splashLike && !MAIN_ACTIVITY.equals(name)
+                                && !activity.isFinishing() && !activity.isDestroyed()) {
+                            note("BLOCK splash-like Activity: " + name);
+                            try {
+                                android.content.Intent intent = new android.content.Intent();
+                                intent.setClassName(PACKAGE, MAIN_ACTIVITY);
+                                intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+                                        | android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                                activity.startActivity(intent);
+                                activity.finish();
+                                activity.overridePendingTransition(0, 0);
+                                note("Started MainActivity to skip splash-like Activity.");
+                                copyClipboard(activity);
+                            } catch (Throwable t) {
+                                note("Splash Activity skip failed: " + t.getClass().getSimpleName());
+                            }
+                        }
                     }
                 }
                 return result;
             });
-            note("Hook OK: Activity.onCreate");
+            note("Hook OK: Activity.onCreate (splash-like Activity detection)");
         } catch (Throwable t) {
             note("Hook FAIL Activity.onCreate: " + t.getClass().getSimpleName() + ": " + t.getMessage());
         }
+    }
 
+    private static void hookDialogShow(XposedModule module) {
         try {
-            Method m = Activity.class.getDeclaredMethod("onResume");
-            module.hook(m).intercept(chain -> {
+            Method show = Dialog.class.getDeclaredMethod("show");
+            module.hook(show).intercept(chain -> {
+                Object obj = chain.getThisObject();
+                if (obj instanceof Dialog) {
+                    Dialog dialog = (Dialog) obj;
+                    if (isTarget(dialog.getContext())
+                            && AD_DIALOG.equals(dialog.getClass().getName())) {
+                        note("BLOCK Dialog.show: " + dialog.getClass().getName());
+                        note("弹窗广告已在显示前拦截；未执行模拟点击。");
+                        copyClipboard(dialog.getContext());
+                        return null;
+                    }
+                }
+                return chain.proceed();
+            });
+            note("Hook OK: Dialog.show (exact AdDialog match only)");
+        } catch (Throwable t) {
+            note("Hook FAIL Dialog.show: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+        }
+    }
+
+    private static void hookActivityResume(XposedModule module) {
+        try {
+            Method resume = Activity.class.getDeclaredMethod("onResume");
+            module.hook(resume).intercept(chain -> {
                 Object result = chain.proceed();
                 Object obj = chain.getThisObject();
                 if (obj instanceof Activity) {
-                    Activity a = (Activity) obj;
-                    if (isTarget(a)) {
-                        lastActivity = a;
-                        if (SEEN.add(a)) note("Activity 首次 Resume: " + a.getClass().getName());
-                        scheduleViewDump(a, "onResume");
+                    Activity activity = (Activity) obj;
+                    if (isTarget(activity)) {
+                        String cls = activity.getClass().getName();
+                        note("Activity.onResume: " + cls);
+                        if (SEEN.add(activity)) {
+                            note("first resume for activity; intent=" + safeIntent(activity));
+                        }
+                        inspectAndSuppressKnownCover(activity);
+                        scheduleCopy(activity);
                     }
                 }
                 return result;
@@ -110,232 +153,148 @@ public final class XiaomiShop {
         }
     }
 
-    private static void hookDialogs(XposedModule module) {
+    /**
+     * The supplied view-tree log contains the video-cover structure:
+     * root -> bg_img / MiVideoPlayerView(coverVideo) / coverImage /
+     * closeVideoBtn. Only hide the matching cover container if all signature
+     * elements are present, to avoid hiding unrelated shopping UI.
+     */
+    private static void inspectAndSuppressKnownCover(Activity activity) {
         try {
-            Method m = Dialog.class.getDeclaredMethod("show");
-            module.hook(m).intercept(chain -> {
-                Object obj = chain.getThisObject();
-                if (obj instanceof Dialog) {
-                    Dialog d = (Dialog) obj;
-                    Context c = d.getContext();
-                    if (isTarget(c)) {
-                        note("Dialog.show: " + d.getClass().getName());
-                        try {
-                            if (d.getWindow() != null) {
-                                note("Dialog Window type: " + d.getWindow().getClass().getName());
-                            }
-                        } catch (Throwable ignored) {}
-                    }
-                }
-                Object result = chain.proceed();
-                if (obj instanceof Dialog && isTarget(((Dialog) obj).getContext())) {
-                    final Dialog d = (Dialog) obj;
-                    MAIN.postDelayed(() -> {
-                        try {
-                            if (d.isShowing() && d.getWindow() != null) {
-                                note("Dialog 已显示: " + d.getClass().getName());
-                                View v = d.getWindow().getDecorView();
-                                dumpViewTree(v, "DialogView");
-                                copyClipboard(d.getContext());
-                            }
-                        } catch (Throwable t) {
-                            note("Dialog 读取失败: " + t.getClass().getSimpleName());
-                        }
-                    }, 250);
-                }
-                return result;
-            });
-            note("Hook OK: Dialog.show");
+            View decor = activity.getWindow() == null ? null : activity.getWindow().getDecorView();
+            if (decor == null) return;
+            int[] count = {0};
+            scan(decor, activity, count);
         } catch (Throwable t) {
-            note("Hook FAIL Dialog.show: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+            note("cover scan error: " + t.getClass().getSimpleName());
         }
     }
 
-    private static void hookPopups(XposedModule module) {
-        int count = 0;
-        for (Method m : PopupWindow.class.getDeclaredMethods()) {
-            String n = m.getName();
-            if (!n.startsWith("show")) continue;
-            if (m.getParameterTypes().length == 0) continue;
-            String key = m.toGenericString();
-            if (!HOOKED.add(key)) continue;
-            try {
-                module.hook(m).intercept(chain -> {
-                    Object obj = chain.getThisObject();
-                    if (obj instanceof PopupWindow) {
-                        PopupWindow p = (PopupWindow) obj;
-                        View content = p.getContentView();
-                        Context c = content == null ? null : content.getContext();
-                        if (isTarget(c)) {
-                            note("PopupWindow." + n + ": " + p.getClass().getName()
-                                    + ", content=" + (content == null ? "null" : content.getClass().getName()));
-                        }
+    private static void scan(View view, Activity activity, int[] count) {
+        if (view == null || count[0]++ > MAX_NODES) return;
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            int n = group.getChildCount();
+            for (int i = 0; i < n && count[0] < MAX_NODES; i++) {
+                View child = group.getChildAt(i);
+                if (isKnownCoverRoot(child)) {
+                    if (child.getVisibility() == View.VISIBLE) {
+                        child.setVisibility(View.GONE);
+                        note("BLOCK known video-cover root: " + describe(child));
+                        copyClipboard(activity);
+                    } else {
+                        noteOnce("known video-cover root found but already hidden: " + describe(child));
                     }
-                    Object result = chain.proceed();
-                    if (obj instanceof PopupWindow) {
-                        PopupWindow p = (PopupWindow) obj;
-                        View content = p.getContentView();
-                        Context c = content == null ? null : content.getContext();
-                        if (isTarget(c)) {
-                            dumpViewTree(content, "PopupView");
-                            copyClipboard(c);
-                        }
-                    }
-                    return result;
-                });
-                count++;
-            } catch (Throwable t) {
-                note("Hook FAIL PopupWindow." + n + ": " + t.getClass().getSimpleName());
+                } else {
+                    scan(child, activity, count);
+                }
             }
         }
-        note("PopupWindow show* Hook 数量: " + count);
     }
 
-    private static void hookWebView(XposedModule module) {
-        try {
-            Method m = WebView.class.getDeclaredMethod("loadUrl", String.class);
-            module.hook(m).intercept(chain -> {
-                Object obj = chain.getThisObject();
-                Object url = chain.getArg(0);
-                if (obj instanceof WebView && isTarget(((WebView) obj).getContext())) {
-                    note("WebView.loadUrl: " + scrubUrl(String.valueOf(url)));
-                }
-                return chain.proceed();
-            });
-            note("Hook OK: WebView.loadUrl(String)");
-        } catch (Throwable t) {
-            note("Hook FAIL WebView.loadUrl: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+    private static boolean isKnownCoverRoot(View view) {
+        if (!(view instanceof ViewGroup)) return false;
+        String cls = view.getClass().getName();
+        // Runtime trace showed a FrameLayout named root containing coverVideo.
+        if (!"android.widget.FrameLayout".equals(cls)) return false;
+        String idName = resourceName(view);
+        if (!"root".equals(idName)) return false;
+        return hasDescendantSignature((ViewGroup) view, 0, new int[]{0});
+    }
+
+    private static boolean hasDescendantSignature(ViewGroup group, int depth, int[] nodes) {
+        if (depth > 7 || nodes[0]++ > 70) return false;
+        boolean video = false, close = false, cover = false, bg = false;
+        for (int i = 0; i < group.getChildCount(); i++) {
+            View child = group.getChildAt(i);
+            String id = resourceName(child);
+            String cn = child.getClass().getName();
+            if ("coverVideo".equals(id) || cn.equals("com.xiaomi.shop.lib.video2.base.MiVideoPlayerView")) video = true;
+            if ("closeVideoBtn".equals(id) || "closeBtn".equals(id)) close = true;
+            if ("coverImage".equals(id)) cover = true;
+            if ("bg_img".equals(id)) bg = true;
+            if (child instanceof ViewGroup && hasDescendantSignature((ViewGroup) child, depth + 1, nodes)) {
+                video = true;
+            }
         }
+        return video && close && cover && bg;
     }
 
-    private static boolean isTarget(Activity a) {
-        try { return a != null && PACKAGE.equals(a.getPackageName()); }
-        catch (Throwable ignored) { return false; }
-    }
-
-    private static boolean isTarget(Context c) {
-        try { return c != null && PACKAGE.equals(c.getPackageName()); }
-        catch (Throwable ignored) { return false; }
-    }
-
-    private static void scheduleViewDump(final Activity a, final String source) {
+    private static void scheduleCopy(Activity activity) {
         try {
-            View decor = a.getWindow() == null ? null : a.getWindow().getDecorView();
-            if (decor == null) return;
-            decor.postDelayed(() -> {
-                try {
-                    note("---- View 树快照 (" + source + "): " + a.getClass().getName() + " ----");
-                    dumpViewTree(a.getWindow().getDecorView(), "ActivityView");
-                    copyClipboard(a);
-                } catch (Throwable t) {
-                    note("View 树读取失败: " + t.getClass().getSimpleName());
-                }
-            }, 700);
+            View decor = activity.getWindow() == null ? null : activity.getWindow().getDecorView();
+            if (decor != null) decor.postDelayed(() -> copyClipboard(activity), 500);
         } catch (Throwable ignored) {}
     }
 
-    private static synchronized void note(String s) {
-        String line = timestamp() + " " + s;
-        Log.i(TAG, line);
-        LOG.append(line).append('\n');
-        if (LOG.length() > MAX_LOG_CHARS) {
-            LOG.delete(0, LOG.length() - MAX_LOG_CHARS);
-        }
+    private static void copyClipboardForProcess(XposedModule module) {
+        // Clipboard is copied when an Activity resumes or a target popup is intercepted.
+        note("Clipboard policy: copy on activity resume and popup interception.");
     }
 
-    private static void dumpViewTree(View root, String prefix) {
-        if (root == null) {
-            note(prefix + ": root=null");
-            return;
-        }
-        int[] count = {0};
-        dumpNode(root, prefix, 0, count);
-        if (count[0] >= MAX_VIEW_NODES) note(prefix + ": 达到节点上限 " + MAX_VIEW_NODES);
+    private static boolean isTarget(Context context) {
+        try { return context != null && PACKAGE.equals(context.getPackageName()); }
+        catch (Throwable ignored) { return false; }
     }
 
-    private static void dumpNode(View v, String prefix, int depth, int[] count) {
-        if (v == null || count[0] >= MAX_VIEW_NODES || depth > 18) return;
-        count[0]++;
-        StringBuilder line = new StringBuilder();
-        line.append(prefix).append(" ").append(indent(depth))
-                .append(v.getClass().getName());
+    private static String safeIntent(Activity a) {
+        try {
+            if (a.getIntent() == null) return "null";
+            return "action=" + a.getIntent().getAction()
+                    + ", data=" + (a.getIntent().getData() == null ? "null" : scrubUrl(a.getIntent().getData().toString()));
+        } catch (Throwable t) { return "unavailable"; }
+    }
+
+    private static String resourceName(View v) {
         try {
             int id = v.getId();
-            if (id != View.NO_ID) {
-                line.append(" id=").append(id);
-                try { line.append("(").append(v.getResources().getResourceEntryName(id)).append(")"); }
-                catch (Throwable ignored) {}
-            }
-        } catch (Throwable ignored) {}
-        try {
-            CharSequence desc = v.getContentDescription();
-            if (desc != null && desc.length() > 0) line.append(" desc=\"").append(trim(desc.toString(), 100)).append("\"");
-        } catch (Throwable ignored) {}
-        if (v instanceof TextView) {
-            try {
-                CharSequence text = ((TextView) v).getText();
-                if (text != null && text.length() > 0) {
-                    String txt = trim(text.toString().replace('\n', ' '), 120);
-                    line.append(" text=\"").append(txt).append("\"");
-                }
-            } catch (Throwable ignored) {}
-        }
-        line.append(" visibility=").append(v.getVisibility())
-                .append(" size=").append(v.getWidth()).append("x").append(v.getHeight());
-        note(line.toString());
-        if (v instanceof ViewGroup) {
-            ViewGroup g = (ViewGroup) v;
-            int children = g.getChildCount();
-            for (int i = 0; i < children && count[0] < MAX_VIEW_NODES; i++) {
-                dumpNode(g.getChildAt(i), prefix, depth + 1, count);
-            }
-        }
+            if (id == View.NO_ID) return "";
+            return v.getResources().getResourceEntryName(id);
+        } catch (Throwable ignored) { return ""; }
     }
 
-    private static String indent(int n) {
-        StringBuilder b = new StringBuilder();
-        for (int i = 0; i < n && i < 20; i++) b.append("  ");
-        return b.toString();
+    private static String describe(View v) {
+        return v.getClass().getName() + " id=" + resourceName(v) + " visibility=" + v.getVisibility();
     }
 
-    private static String timestamp() {
-        return new java.text.SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
-                .format(new java.util.Date());
+    private static synchronized void note(String message) {
+        String line = new java.text.SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+                .format(new java.util.Date()) + " " + redact(message);
+        LOG.append(line).append('\n');
+        if (LOG.length() > MAX_CHARS) LOG.delete(0, LOG.length() - MAX_CHARS);
+        Log.i(TAG, line);
     }
 
-    private static String safe(String s) {
-        return s == null ? "null" : s.replace('\n', ' ').replace('\r', ' ');
+    private static synchronized void noteOnce(String message) {
+        String needle = redact(message);
+        if (LOG.indexOf(needle) < 0) note(message);
     }
 
-    private static String trim(String s, int max) {
-        if (s == null) return "";
-        s = s.replaceAll("(?i)(token|cookie|session|auth|password|phone|mobile)\\s*[:=]\\s*[^,; ]+", "$1=<hidden>");
-        return s.length() <= max ? s : s.substring(0, max) + "...";
+    private static String redact(String s) {
+        if (s == null) return "null";
+        return s.replaceAll("(?i)(token|cookie|session|authorization|password|phone|mobile)\\s*[:=]\\s*[^,; ]+", "$1=<hidden>");
     }
 
     private static String scrubUrl(String url) {
         if (url == null) return "null";
         int q = url.indexOf('?');
-        if (q >= 0) return url.substring(0, q) + "?<query-hidden>";
-        return url;
+        return q >= 0 ? url.substring(0, q) + "?<query-hidden>" : url;
     }
 
     private static void copyClipboard(Context context) {
-        if (context == null || !isTarget(context)) return;
+        if (!isTarget(context)) return;
         try {
-            ClipboardManager cm = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
-            if (cm == null) return;
-            String contents;
-            synchronized (XiaomiShop.class) {
-                contents = LOG.toString();
-            }
-            cm.setPrimaryClip(ClipData.newPlainText("SplashSkip 小米商城诊断日志", contents));
-            if (!toastShown && context instanceof Activity) {
-                toastShown = true;
-                android.widget.Toast.makeText(context, "SplashSkip：诊断日志已复制到剪贴板", android.widget.Toast.LENGTH_LONG).show();
+            ClipboardManager manager = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
+            if (manager == null) return;
+            String text;
+            synchronized (XiaomiShop.class) { text = LOG.toString(); }
+            manager.setPrimaryClip(ClipData.newPlainText("SplashSkip Xiaomi Shop log", text));
+            if (!firstToastShown && context instanceof Activity) {
+                firstToastShown = true;
+                android.widget.Toast.makeText(context, "SplashSkip：小米商城日志已复制到剪贴板", android.widget.Toast.LENGTH_SHORT).show();
             }
         } catch (Throwable t) {
-            Log.w(TAG, "复制剪贴板失败: " + t.getClass().getSimpleName());
+            Log.w(TAG, "clipboard copy failed: " + t.getClass().getSimpleName());
         }
     }
 }
