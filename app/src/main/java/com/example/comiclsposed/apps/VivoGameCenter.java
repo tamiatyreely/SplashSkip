@@ -16,7 +16,7 @@ import java.util.WeakHashMap;
 import io.github.libxposed.api.XposedModule;
 
 /**
- * SplashSkip —— vivo 游戏中心开屏跳过模块。
+ * vivo 游戏中心去广告模块。
  *
  * 核心策略：
  * 在 LogoActivity / SimpleSplashActivity 的 onCreate 返回之后
@@ -25,9 +25,9 @@ import io.github.libxposed.api.XposedModule;
  *
  * onResume 保留兜底 Hook，正常情况下不会触发。
  */
-public final class SplashSkip {
+public final class VivoGameCenter {
 
-    private static final String TAG = "SplashSkip";
+    private static final String TAG = "VivoGameFilter";
 
     private static final String PACKAGE = "com.vivo.game";
     private static final String LOGO_ACTIVITY =
@@ -49,7 +49,7 @@ public final class SplashSkip {
     private static volatile boolean installed;
     private static volatile boolean adSdkHooked;
 
-    private SplashSkip() {
+    private VivoGameCenter() {
     }
 
     public static synchronized void install(XposedModule module) {
@@ -58,7 +58,7 @@ public final class SplashSkip {
         }
         installed = true;
 
-        diag("=== SplashSkip 模块启动 ===");
+        diag("=== Vivo 游戏中心去广告模块启动 ===");
         diag("目标包名: " + PACKAGE);
 
         hookActivityOnCreate(module);
@@ -312,6 +312,6 @@ public final class SplashSkip {
     // ============================================================
 
     private static void diag(String message) {
-        Log.i(TAG, "[SplashSkip] " + message);
+        Log.i(TAG, "[VIVO_FIX] " + message);
     }
 }
