@@ -2,8 +2,6 @@ package com.example.comiclsposed.apps;
 
 import android.app.Activity;
 import android.app.Dialog;
-import android.content.ClipData;
-import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Bundle;
@@ -12,7 +10,6 @@ import android.os.Looper;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.Toast;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -25,28 +22,42 @@ import io.github.libxposed.api.XposedModule;
 
 /**
  * Xiaomi Shop 5.54.0.20260811.r1 adapter.
- * 去开屏：
- *   1) MainTabActivity 是 splash 壳 → onCreate 后主动跳 MainActivity
- *   2) displaySplashView proceed + 30/200/800ms 反复 removeSplashTree 兜底
- *   3) 扫描条件放宽到 id/class 含 "splash" 即命中，整棵子树 remove
+ *
+ * 功能：
+ *  1) 开屏：MainTabActivity 是 splash 壳 → onCreate 后主动跳 MainActivity；
+ *     displaySplashView proceed + 30/200/800ms 反复 removeSplashTree 兜底。
+ *  2) 弹窗：精确拦截 AdDialog.show。
+ *  3) 悬浮广告：onResume 后 1.5/3/6s 扫描 decor/content 直接子层，
+ *     类名或 id 命中明确悬浮广告关键词就 remove；疑似广告只打日志。
+ *  4) 日志仅输出到 Logcat（TAG: SplashSkip-Xiaomi），不使用剪贴板、不弹 Toast。
  */
 public final class XiaomiShop {
 
     private static final String TAG = "SplashSkip-Xiaomi";
     private static final String PACKAGE = "com.xiaomi.shop";
-    // 真正的首页（日志里 4 秒后跳到这里）
     private static final String MAIN_ACTIVITY = "com.xiaomi.shop2.activity.MainActivity";
-    // splash 壳
     private static final String SPLASH_ACTIVITY = "com.xiaomi.shop.activity.MainTabActivity";
     private static final String AD_DIALOG = "com.xiaomi.shop.plugin.homepage.utils.AdDialog";
     private static final int MAX_CHARS = 45000;
     private static final int MAX_NODES = 400;
 
+    // 明确悬浮广告关键词（类名或 id 小写后包含其中任一 → 直接 remove）
+    private static final String[] FLOATING_AD_KEYWORDS = {
+            "floatad", "floatingad", "suspensionad", "popupad",
+            "adfloat", "ad_popup", "ad_float", "adfloatlayer",
+            "adfloating", "floating_ad", "float_ad", "suspension_ad"
+    };
+
+    // 疑似广告特征（类名或 id 含其中之一 → 只打 Logcat 日志，不 remove）
+    private static final String[] AD_HINT_KEYWORDS = {
+            "advert", "adlayer", "adbanner", "adpopup",
+            "adview", "ad_view", "adcontainer", "ad_container"
+    };
+
     private static final StringBuilder LOG = new StringBuilder();
     private static final Set<Activity> SEEN = Collections.synchronizedSet(
             Collections.newSetFromMap(new WeakHashMap<Activity, Boolean>()));
     private static volatile boolean installed;
-    private static volatile boolean firstToastShown;
     private static volatile boolean splashHookAttempted;
     private static volatile boolean redirected;
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
@@ -62,7 +73,7 @@ public final class XiaomiShop {
         hookActivityCreate(module);
         hookDialogShow(module);
         hookActivityResume(module);
-        note("Hooks installed (redirect + removeSplashTree)");
+        note("Hooks installed (redirect + removeSplashTree + floating-ad-removal)");
     }
 
     // ------------------------------------------------------------------
@@ -81,7 +92,6 @@ public final class XiaomiShop {
                 if (activity != null && isTarget(activity)) {
                     String name = activity.getClass().getName();
                     note("Activity.onCreate: " + name);
-                    // splash 壳：onCreate 完立刻跳真正的首页
                     if (SPLASH_ACTIVITY.equals(name) && !redirected) {
                         redirected = true;
                         MAIN.postDelayed(() -> redirectToMain(activity), 150);
@@ -107,12 +117,12 @@ public final class XiaomiShop {
             splashActivity.overridePendingTransition(0, 0);
         } catch (Throwable t) {
             note("redirect failed: " + t.getClass().getSimpleName() + ": " + t.getMessage());
-            redirected = false; // 允许重试
+            redirected = false;
         }
     }
 
     // ------------------------------------------------------------------
-    // Dialog.show：仅拦截 AdDialog
+    // Dialog.show
     // ------------------------------------------------------------------
     private static void hookDialogShow(XposedModule module) {
         try {
@@ -125,7 +135,6 @@ public final class XiaomiShop {
                             && AD_DIALOG.equals(dialog.getClass().getName())) {
                         note("BLOCK Dialog.show: " + AD_DIALOG);
                         try { if (dialog.isShowing()) dialog.dismiss(); } catch (Throwable ignored) {}
-                        copyClipboard(dialog.getContext());
                         return null;
                     }
                 }
@@ -138,7 +147,7 @@ public final class XiaomiShop {
     }
 
     // ------------------------------------------------------------------
-    // Activity.onResume：兜底 removeSplashTree + 复制日志
+    // Activity.onResume
     // ------------------------------------------------------------------
     private static void hookActivityResume(XposedModule module) {
         try {
@@ -154,7 +163,7 @@ public final class XiaomiShop {
                             note("first resume for activity; intent=" + safeIntent(activity));
                         }
                         scheduleRemoveSplash(activity);
-                        scheduleCopy(activity, 1500);
+                        scheduleFloatingAdScan(activity);
                     }
                 }
                 return result;
@@ -165,15 +174,15 @@ public final class XiaomiShop {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Splash 清理
+    // ------------------------------------------------------------------
     private static void scheduleRemoveSplash(Activity activity) {
         MAIN.postDelayed(() -> removeSplashTree(activity), 30);
         MAIN.postDelayed(() -> removeSplashTree(activity), 200);
         MAIN.postDelayed(() -> removeSplashTree(activity), 800);
     }
 
-    // ------------------------------------------------------------------
-    // Hook SplashPresenter.displaySplashView：proceed 后连续 remove
-    // ------------------------------------------------------------------
     private static synchronized void hookSplashManager(XposedModule module, ClassLoader loader) {
         if (splashHookAttempted) return;
         splashHookAttempted = true;
@@ -224,21 +233,13 @@ public final class XiaomiShop {
         }
     }
 
-    /**
-     * 在 activity 里找到含 splash 的子树，从 contentView / decorView 的
-     * 直接子层级整棵 remove。
-     * 只要 id / 类名里含 "splash" 就算命中，避免之前
-     * bg_splash_logo_img / bg_splash_logo_lin 这种 id 匹配不到的问题。
-     */
     private static void removeSplashTree(Activity activity) {
         try {
             View decor = activity.getWindow() == null ? null : activity.getWindow().getDecorView();
             if (!(decor instanceof ViewGroup)) return;
             ViewGroup decorGroup = (ViewGroup) decor;
-
             View content = decorGroup.findViewById(android.R.id.content);
 
-            // 1) contentView 内部（splash 通常挂在 content 里）
             if (content instanceof ViewGroup) {
                 ViewGroup contentGroup = (ViewGroup) content;
                 for (int i = contentGroup.getChildCount() - 1; i >= 0; i--) {
@@ -250,7 +251,6 @@ public final class XiaomiShop {
                 }
             }
 
-            // 2) decorView 非 content 的直接子（overlay 形式的 splash）
             for (int i = decorGroup.getChildCount() - 1; i >= 0; i--) {
                 View child = decorGroup.getChildAt(i);
                 if (child == content) continue;
@@ -264,7 +264,6 @@ public final class XiaomiShop {
         }
     }
 
-    /** id / 类名含 "splash" 即视为命中（不区分大小写）。 */
     private static boolean containsSplash(View v, int[] count) {
         if (v == null || count[0]++ > MAX_NODES) return false;
         String cls = v.getClass().getName().toLowerCase(Locale.ROOT);
@@ -275,6 +274,75 @@ public final class XiaomiShop {
             for (int i = 0; i < g.getChildCount() && count[0] < MAX_NODES; i++) {
                 if (containsSplash(g.getChildAt(i), count)) return true;
             }
+        }
+        return false;
+    }
+
+    // ------------------------------------------------------------------
+    // 悬浮广告扫描
+    // ------------------------------------------------------------------
+    private static void scheduleFloatingAdScan(Activity activity) {
+        MAIN.postDelayed(() -> scanAndRemoveFloatingAds(activity), 1500);
+        MAIN.postDelayed(() -> scanAndRemoveFloatingAds(activity), 3000);
+        MAIN.postDelayed(() -> scanAndRemoveFloatingAds(activity), 6000);
+    }
+
+    private static void scanAndRemoveFloatingAds(Activity activity) {
+        try {
+            if (activity.isFinishing() || activity.isDestroyed()) return;
+            View decor = activity.getWindow() == null ? null : activity.getWindow().getDecorView();
+            if (!(decor instanceof ViewGroup)) return;
+            ViewGroup decorGroup = (ViewGroup) decor;
+            View content = decorGroup.findViewById(android.R.id.content);
+
+            // 1) decorView 直接子层（content 之外 → 悬浮层最可能的所在）
+            for (int i = decorGroup.getChildCount() - 1; i >= 0; i--) {
+                View child = decorGroup.getChildAt(i);
+                if (child == content) continue;
+                handleFloatingCandidate(child, decorGroup, i, "decor");
+            }
+
+            // 2) contentView 直接子层（overlay 型悬浮层通常也在这一层）
+            if (content instanceof ViewGroup) {
+                ViewGroup contentGroup = (ViewGroup) content;
+                for (int i = contentGroup.getChildCount() - 1; i >= 0; i--) {
+                    View child = contentGroup.getChildAt(i);
+                    handleFloatingCandidate(child, contentGroup, i, "content");
+                }
+            }
+        } catch (Throwable t) {
+            note("floating scan error: " + t.getClass().getSimpleName());
+        }
+    }
+
+    private static void handleFloatingCandidate(View view, ViewGroup parent, int index, String where) {
+        try {
+            String cls = view.getClass().getName();
+            String id = resourceName(view);
+            String lowerCls = cls.toLowerCase(Locale.ROOT);
+            String lowerId = id.toLowerCase(Locale.ROOT);
+
+            boolean explicit = matchesAny(lowerCls, lowerId, FLOATING_AD_KEYWORDS);
+            boolean hint = matchesAny(lowerCls, lowerId, AD_HINT_KEYWORDS);
+
+            if (explicit) {
+                parent.removeViewAt(index);
+                note("Removed floating ad (" + where + "): " + cls + " id=" + id);
+            } else if (hint) {
+                // 只打日志，不删除，供后续确认关键词
+                note("Suspected ad view (" + where + "): " + cls
+                        + " id=" + id
+                        + " visibility=" + view.getVisibility()
+                        + " size=" + view.getWidth() + "x" + view.getHeight());
+            }
+        } catch (Throwable t) {
+            note("floating candidate error: " + t.getClass().getSimpleName());
+        }
+    }
+
+    private static boolean matchesAny(String cls, String id, String[] keywords) {
+        for (String kw : keywords) {
+            if (cls.contains(kw) || id.contains(kw)) return true;
         }
         return false;
     }
@@ -307,13 +375,6 @@ public final class XiaomiShop {
     // ------------------------------------------------------------------
     // 工具方法
     // ------------------------------------------------------------------
-    private static void scheduleCopy(Activity activity, long delayMs) {
-        try {
-            View decor = activity.getWindow() == null ? null : activity.getWindow().getDecorView();
-            if (decor != null) decor.postDelayed(() -> copyClipboard(activity), delayMs);
-        } catch (Throwable ignored) {}
-    }
-
     private static boolean isTarget(Context context) {
         try { return context != null && PACKAGE.equals(context.getPackageName()); }
         catch (Throwable ignored) { return false; }
@@ -359,24 +420,5 @@ public final class XiaomiShop {
         if (url == null) return "null";
         int q = url.indexOf('?');
         return q >= 0 ? url.substring(0, q) + "?<query-hidden>" : url;
-    }
-
-    private static void copyClipboard(Context context) {
-        if (!isTarget(context)) return;
-        try {
-            ClipboardManager manager = (ClipboardManager)
-                    context.getSystemService(Context.CLIPBOARD_SERVICE);
-            if (manager == null) return;
-            String text;
-            synchronized (XiaomiShop.class) { text = LOG.toString(); }
-            manager.setPrimaryClip(ClipData.newPlainText("SplashSkip Xiaomi Shop log", text));
-            if (!firstToastShown && context instanceof Activity) {
-                firstToastShown = true;
-                Toast.makeText(context, "SplashSkip：小米商城日志已复制到剪贴板",
-                        Toast.LENGTH_SHORT).show();
-            }
-        } catch (Throwable t) {
-            Log.w(TAG, "clipboard copy failed: " + t.getClass().getSimpleName());
-        }
     }
 }
