@@ -1,13 +1,8 @@
 package com.example.comiclsposed.apps;
 
 import android.app.Activity;
-import android.content.ClipData;
-import android.content.ClipboardManager;
-import android.content.Context;
 import android.content.Intent;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
 import android.util.Log;
 
 import java.lang.reflect.Method;
@@ -21,16 +16,18 @@ import java.util.WeakHashMap;
 import io.github.libxposed.api.XposedModule;
 
 /**
- * vivo 游戏中心去广告模块（彻底消除开屏闪现版）。
+ * SplashSkip —— vivo 游戏中心开屏跳过模块。
  *
- * 关键调整：
- * 1. 跳过延迟设为 0，onResume 后立即 finish，不给广告渲染时间。
- * 2. 调用 overridePendingTransition(0, 0) 禁用切换动画，消除视觉闪烁。
- * 3. 先 startActivity 再 finish，保证过渡平滑。
+ * 核心策略：
+ * 在 LogoActivity / SimpleSplashActivity 的 onCreate 返回之后
+ * 立即 startActivity + finish，此时窗口尚未 attach 到 WMS，
+ * 因此不会绘制任何一帧广告，彻底消除“闪一下”。
+ *
+ * onResume 保留兜底 Hook，正常情况下不会触发。
  */
-public final class VivoGameCenter {
+public final class SplashSkip {
 
-    private static final String TAG = "VivoGameFilter";
+    private static final String TAG = "SplashSkip";
 
     private static final String PACKAGE = "com.vivo.game";
     private static final String LOGO_ACTIVITY =
@@ -42,29 +39,17 @@ public final class VivoGameCenter {
     private static final String AD_SDK =
             "com.vivo.adsdk.common.VivoADSDK";
 
-    /** 关键修改：延迟设为 0，立即跳过 */
-    private static final long LOGO_SKIP_DELAY_MS = 0L;
-
-    private static final long CLIPBOARD_DEBOUNCE_MS = 900L;
-    private static final int MAX_LOG_LENGTH = 28000;
-
-    private static final Handler MAIN_HANDLER =
-            new Handler(Looper.getMainLooper());
-
-    private static final StringBuilder DIAG_LOG = new StringBuilder();
-
     private static final Set<String> HOOKED_METHODS =
             Collections.synchronizedSet(new HashSet<>());
 
-    private static final Set<Activity> HANDLED_SPLASH_ACTIVITIES =
+    private static final Set<Activity> HANDLED_ACTIVITIES =
             Collections.synchronizedSet(
                     Collections.newSetFromMap(new WeakHashMap<>()));
 
     private static volatile boolean installed;
-    private static volatile Activity currentActivity;
     private static volatile boolean adSdkHooked;
 
-    private VivoGameCenter() {
+    private SplashSkip() {
     }
 
     public static synchronized void install(XposedModule module) {
@@ -73,35 +58,36 @@ public final class VivoGameCenter {
         }
         installed = true;
 
-        diag("=== Vivo 游戏中心去广告模块启动（彻底消除闪现版）===");
+        diag("=== SplashSkip 模块启动 ===");
         diag("目标包名: " + PACKAGE);
-        diag("跳过延迟: " + LOGO_SKIP_DELAY_MS + "ms (立即跳过)");
 
-        hookAllActivityOnCreate(module);
-        hookAllActivityOnResume(module);
+        hookActivityOnCreate(module);
+        hookActivityOnResume(module);
         hookStartActivity(module);
 
         diag("=== 所有 Hook 安装完成 ===");
     }
 
     // ============================================================
-    //  1. 全局 Activity.onCreate：记录 + Logo 页注入 + 动态 Hook SDK
+    //  1. Activity.onCreate：核心跳过点
     // ============================================================
 
-    private static void hookAllActivityOnCreate(XposedModule module) {
+    private static void hookActivityOnCreate(XposedModule module) {
         try {
             Method onCreate = Activity.class.getDeclaredMethod(
                     "onCreate", Bundle.class);
 
             module.hook(onCreate).intercept(chain -> {
+                Activity act = null;
+                String name = null;
+
                 Object obj = chain.getThisObject();
                 if (obj instanceof Activity) {
-                    Activity act = (Activity) obj;
+                    act = (Activity) obj;
                     try {
                         if (PACKAGE.equals(act.getPackageName())) {
-                            String name = act.getClass().getName();
+                            name = act.getClass().getName();
                             diag("Activity: " + name);
-                            currentActivity = act;
 
                             if (LOGO_ACTIVITY.equals(name)) {
                                 injectSkipExtras(act);
@@ -113,12 +99,25 @@ public final class VivoGameCenter {
                     } catch (Throwable ignored) {
                     }
                 }
-                return chain.proceed();
+
+                // 先让原始 onCreate 完整执行
+                Object result = chain.proceed();
+
+                // onCreate 返回后立即跳过，此时窗口尚未 attach 到 WMS
+                if (act != null && name != null
+                        && (LOGO_ACTIVITY.equals(name)
+                                || SIMPLE_SPLASH_ACTIVITY.equals(name))) {
+                    if (HANDLED_ACTIVITIES.add(act)) {
+                        skipImmediately(act, name);
+                    }
+                }
+
+                return result;
             });
-            diag("全局 Activity.onCreate Hook OK");
+            diag("Activity.onCreate Hook OK");
 
         } catch (Throwable e) {
-            diag("全局 Activity.onCreate Hook 失败: " + e);
+            diag("Activity.onCreate Hook 失败: " + e);
         }
     }
 
@@ -166,7 +165,6 @@ public final class VivoGameCenter {
                 module.hook(m).intercept(chain -> {
                     diag("拦截 VivoADSDK.init: "
                             + m.toGenericString());
-
                     Class<?> ret = m.getReturnType();
                     if (ret == boolean.class) return false;
                     if (ret == int.class) return 0;
@@ -180,23 +178,49 @@ public final class VivoGameCenter {
                 });
                 count++;
             }
-            diag("动态 Hook VivoADSDK.init 完成，数量: " + count);
-
-            if (count == 0) {
-                diag("警告：VivoADSDK 的 init 均为抽象方法，"
-                        + "实际实现类未知，SDK 初始化可能未被拦截");
-            }
+            diag("VivoADSDK.init Hook 完成，数量: " + count);
 
         } catch (Throwable e) {
-            diag("动态 Hook VivoADSDK 失败: " + e);
+            diag("Hook VivoADSDK 失败: " + e);
+        }
+    }
+
+    /**
+     * 在 onCreate 返回后立即执行跳过。
+     * 此时 Activity 窗口未 attach，不会产生任何可见帧。
+     */
+    private static void skipImmediately(Activity act, String name) {
+        try {
+            if (act.isFinishing() || act.isDestroyed()) {
+                diag("跳过被忽略（已 finishing）: " + name);
+                return;
+            }
+
+            diag("立即跳过: " + name);
+
+            Intent intent = new Intent();
+            intent.setClassName(PACKAGE, MAIN_ACTIVITY);
+            intent.addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK
+                            | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+
+            // 先启动主界面，再 finish 当前页，禁用切换动画
+            act.startActivity(intent);
+            act.finish();
+            act.overridePendingTransition(0, 0);
+
+            diag("已跳过 " + name + " 并启动主界面");
+
+        } catch (Throwable e) {
+            diag("跳过失败: " + e);
         }
     }
 
     // ============================================================
-    //  2. 全局 Activity.onResume：立即跳过 Splash 页
+    //  2. Activity.onResume：兜底（正常不会触发）
     // ============================================================
 
-    private static void hookAllActivityOnResume(XposedModule module) {
+    private static void hookActivityOnResume(XposedModule module) {
         try {
             Method onResume = Activity.class.getDeclaredMethod("onResume");
 
@@ -207,15 +231,11 @@ public final class VivoGameCenter {
                     try {
                         if (PACKAGE.equals(act.getPackageName())) {
                             String name = act.getClass().getName();
-
                             if (LOGO_ACTIVITY.equals(name)
                                     || SIMPLE_SPLASH_ACTIVITY.equals(name)) {
-                                diag("Splash onResume: " + name);
-
-                                if (!HANDLED_SPLASH_ACTIVITIES
-                                        .contains(act)) {
-                                    HANDLED_SPLASH_ACTIVITIES.add(act);
-                                    scheduleSkip(act);
+                                diag("Splash onResume（兜底）: " + name);
+                                if (HANDLED_ACTIVITIES.add(act)) {
+                                    skipImmediately(act, name);
                                 }
                             }
                         }
@@ -224,49 +244,15 @@ public final class VivoGameCenter {
                 }
                 return chain.proceed();
             });
-            diag("全局 Activity.onResume Hook OK");
+            diag("Activity.onResume Hook OK");
 
         } catch (Throwable e) {
-            diag("全局 Activity.onResume Hook 失败: " + e);
+            diag("Activity.onResume Hook 失败: " + e);
         }
     }
 
-    private static void scheduleSkip(Activity act) {
-        // 延迟为 0，直接在当前消息循环中执行
-        MAIN_HANDLER.post(() -> {
-            try {
-                if (act.isFinishing() || act.isDestroyed()) {
-                    return;
-                }
-
-                diag("立即触发跳过: "
-                        + act.getClass().getSimpleName());
-
-                Intent intent = new Intent();
-                intent.setClassName(PACKAGE, MAIN_ACTIVITY);
-                intent.addFlags(
-                        Intent.FLAG_ACTIVITY_NEW_TASK
-                                | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-
-                // 先启动主界面，再结束当前页，避免白屏
-                act.startActivity(intent);
-                act.finish();
-
-                // 关键：禁用 Activity 切换动画，消除闪一下
-                act.overridePendingTransition(0, 0);
-
-                diag("已跳过 "
-                        + act.getClass().getSimpleName()
-                        + " 并启动主界面（无动画）");
-
-            } catch (Throwable e) {
-                diag("跳过失败: " + e);
-            }
-        });
-    }
-
     // ============================================================
-    //  3. 拦截广告 Activity 启动
+    //  3. 拦截广告 Activity 启动（弹窗广告）
     // ============================================================
 
     private static void hookStartActivity(XposedModule module) {
@@ -322,60 +308,10 @@ public final class VivoGameCenter {
     }
 
     // ============================================================
-    //  日志 + 剪贴板自动复制
+    //  日志
     // ============================================================
 
     private static void diag(String message) {
-        String line = "[VIVO_FIX] " + message;
-        Log.i(TAG, line);
-
-        synchronized (DIAG_LOG) {
-            DIAG_LOG.append(line).append('\n');
-            if (DIAG_LOG.length() > MAX_LOG_LENGTH) {
-                DIAG_LOG.delete(0,
-                        DIAG_LOG.length() - MAX_LOG_LENGTH / 2);
-            }
-        }
-
-        scheduleClipboardCopy();
+        Log.i(TAG, "[SplashSkip] " + message);
     }
-
-    private static void scheduleClipboardCopy() {
-        MAIN_HANDLER.removeCallbacks(CLIPBOARD_COPY_RUNNABLE);
-        MAIN_HANDLER.postDelayed(
-                CLIPBOARD_COPY_RUNNABLE,
-                CLIPBOARD_DEBOUNCE_MS);
-    }
-
-    private static final Runnable CLIPBOARD_COPY_RUNNABLE = () -> {
-        Activity activity = currentActivity;
-        if (activity == null) {
-            return;
-        }
-        try {
-            if (activity.isFinishing() || activity.isDestroyed()) {
-                return;
-            }
-
-            String snapshot;
-            synchronized (DIAG_LOG) {
-                snapshot = DIAG_LOG.toString();
-            }
-            if (snapshot.isEmpty()) {
-                return;
-            }
-
-            ClipboardManager clipboard =
-                    (ClipboardManager) activity.getSystemService(
-                            Context.CLIPBOARD_SERVICE);
-            if (clipboard != null) {
-                clipboard.setPrimaryClip(
-                        ClipData.newPlainText(
-                                "Vivo 游戏中心诊断日志",
-                                snapshot));
-            }
-        } catch (Throwable error) {
-            Log.e(TAG, "复制诊断日志失败", error);
-        }
-    };
 }
